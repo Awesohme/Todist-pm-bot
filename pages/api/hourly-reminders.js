@@ -6,7 +6,8 @@ import {
   fingerprintTask,
   getTimedDueDate,
   postToSlack,
-  formatHumanDate
+  formatHumanDate,
+  isWithinQuietHours
 } from "../../lib/agent-helpers.js";
 
 function stageLabel(stage) {
@@ -31,12 +32,18 @@ function isBlockedOrWaiting(task) {
 
 function shouldSkipByConfig(config) {
   if (!config.reminders_enabled) return "Reminders are paused.";
+
   if (config.snoozed_until) {
     const snoozedUntil = new Date(config.snoozed_until);
     if (!Number.isNaN(snoozedUntil.getTime()) && snoozedUntil > new Date()) {
       return `Reminders are snoozed until ${config.snoozed_until}.`;
     }
   }
+
+  if (isWithinQuietHours(config)) {
+    return `Inside quiet hours (${config.quiet_hours_start}:00 → ${config.quiet_hours_end}:00).`;
+  }
+
   return null;
 }
 
