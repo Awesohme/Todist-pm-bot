@@ -1,3 +1,4 @@
+import { waitUntil } from "@vercel/functions";
 import {
   readRawBody,
   verifySlackSignature,
@@ -18,36 +19,43 @@ export const config = {
   },
 };
 
-function jsonResponse(res, text) {
+async function respondToSlack(responseUrl, text, responseType = "ephemeral") {
+  const res = await fetch(responseUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      response_type: responseType,
+      text,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`response_url post failed: ${res.status}`);
+  }
+}
+
+function immediateAck(res, text = "🧠 Got it — working on that now...") {
   return res.status(200).json({
     response_type: "ephemeral",
     text,
   });
 }
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(200).send("Slack command endpoint is live");
-  }
-
-  const rawBody = await readRawBody(req);
-
-  if (!verifySlackSignature(req, rawBody, process.env.SLACK_SIGNING_SECRET)) {
-    return res.status(401).send("Invalid signature");
-  }
-
-  const form = parseSlackForm(rawBody);
+async function handleCommandAsync(form) {
   const text = String(form.text || "").trim();
   const command = text.toLowerCase();
   const userId = form.user_id;
+  const responseUrl = form.response_url;
 
   let config = await getReminderConfig();
   config.slack_user_id = userId || config.slack_user_id;
 
   if (!text || command === "help") {
     await saveReminderConfig(config);
-    return jsonResponse(
-      res,
+    return respondToSlack(
+      responseUrl,
       [
         "*Available `/agent` commands*",
         "• `/agent today`",
@@ -65,8 +73,8 @@ export default async function handler(req, res) {
 
   if (command === "settings") {
     await saveReminderConfig(config);
-    return jsonResponse(
-      res,
+    return respondToSlack(
+      responseUrl,
       [
         "*Reminder settings*",
         `• enabled: ${config.reminders_enabled ? "yes" : "no"}`,
@@ -84,32 +92,35 @@ export default async function handler(req, res) {
   if (command === "pause-reminders") {
     config.reminders_enabled = false;
     await saveReminderConfig(config);
-    return jsonResponse(res, "⏸️ Reminders paused.");
+    return respondToSlack(responseUrl, "⏸️ Reminders paused.");
   }
 
   if (command === "resume-reminders") {
     config.reminders_enabled = true;
     config.snoozed_until = null;
     await saveReminderConfig(config);
-    return jsonResponse(res, "✅ Reminders resumed.");
+    return respondToSlack(responseUrl, "✅ Reminders resumed.");
   }
 
   if (command.startsWith("snooze")) {
     const snoozedUntil = parseSnoozeInput(command);
     if (!snoozedUntil) {
-      return jsonResponse(res, "⚠️ Use something like `/agent snooze 4h` or `/agent snooze 30m`.");
+      return respondToSlack(
+        responseUrl,
+        "⚠️ Use something like `/agent snooze 4h` or `/agent snooze 30m`."
+      );
     }
 
     config.snoozed_until = snoozedUntil;
     config.reminders_enabled = true;
     await saveReminderConfig(config);
-    return jsonResponse(res, `😴 Reminders snoozed until ${snoozedUntil}.`);
+    return respondToSlack(responseUrl, `😴 Reminders snoozed until ${snoozedUntil}.`);
   }
 
   if (command === "disable 30m") {
     config.enable_t30m = false;
     await saveReminderConfig(config);
-    return jsonResponse(res, "🔕 30-minute reminders disabled.");
+    return respondToSlack(responseUrl, "🔕 30-minute reminders disabled.");
   }
 
   if (command === "enable all") {
@@ -119,7 +130,7 @@ export default async function handler(req, res) {
     config.enable_t1h = true;
     config.enable_t30m = true;
     await saveReminderConfig(config);
-    return jsonResponse(res, "✅ All reminder stages enabled.");
+    return respondToSlack(responseUrl, "✅ All reminder stages enabled.");
   }
 
   if (command === "today" || command === "followups" || command === "priorities") {
@@ -128,16 +139,47 @@ export default async function handler(req, res) {
     await saveReminderConfig(config);
 
     if (command === "today") {
-      return jsonResponse(res, quickTodayReply(buckets));
+      return respondToSlack(responseUrl, quickTodayReply(buckets));
     }
     if (command === "followups") {
-      return jsonResponse(res, quickFollowupsReply(buckets));
+      return respondToSlack(responseUrl, quickFollowupsReply(buckets));
     }
-    return jsonResponse(res, quickPrioritiesReply(buckets));
+    return respondToSlack(responseUrl, quickPrioritiesReply(buckets));
   }
 
-  return jsonResponse(
-    res,
+  return respondToSlack(
+    responseUrl,
     "🤔 I don’t know that `/agent` command yet. Try `/agent help`."
+  );
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(200).send("Slack command endpoint is live");
+  }
+
+  const rawBody = await readRawBody(req);
+
+  if (!verifySlackSignature(req, rawBody, process.env.SLACK_SIGNING_SECRET)) {
+    return res.status(401).send("Invalid signature");
+  }
+
+  const form = parseSlackForm(rawBody);
+
+  immediateAck(res);
+
+  waitUntil(
+    handleCommandAsync(form).catch(async (err) => {
+      console.error("slash command failed:", err);
+
+      try {
+        await respondToSlack(
+          form.response_url,
+          `⚠️ /agent failed.\nReason: ${err.message}`
+        );
+      } catch (postErr) {
+        console.error("failed posting slash error:", postErr);
+      }
+    })
   );
 }
