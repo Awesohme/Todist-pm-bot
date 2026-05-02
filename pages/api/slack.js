@@ -1,4 +1,10 @@
-const crypto = require("crypto");
+import crypto from "crypto";
+
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
 
 function timingSafeEqual(a, b) {
   const aBuf = Buffer.from(a);
@@ -90,8 +96,7 @@ function summariseTaskForModel(task) {
   };
 }
 
-function buildBriefPayload(tasks, buckets) {
-  // Keep this compact so free models don't get spammed with rubbish
+function buildBriefPayload(buckets) {
   const important = [
     ...buckets.overdue.slice(0, 10),
     ...buckets.dueToday.slice(0, 10),
@@ -100,7 +105,6 @@ function buildBriefPayload(tasks, buckets) {
     ...buckets.updates.slice(0, 10),
   ];
 
-  // Deduplicate by content + due
   const seen = new Set();
   const deduped = [];
   for (const task of important) {
@@ -141,8 +145,7 @@ async function callOpenRouterBrief(payload) {
             "You are a sharp PM assistant. Be concise, direct, and practical. " +
             "Given task data, return a Slack-friendly briefing with these headings only: " +
             "1) Top risks, 2) What to chase today, 3) What to tell boss, 4) Suggested next 3 actions. " +
-            "Do not waffle. Do not mention missing context unless it truly blocks judgement. " +
-            "Prefer prioritisation over listing everything."
+            "Do not waffle. Prefer prioritisation over listing everything."
         },
         {
           role: "user",
@@ -164,12 +167,38 @@ async function callOpenRouterBrief(payload) {
   return body?.choices?.[0]?.message?.content || "No model response.";
 }
 
-module.exports = async function handler(req, res) {
+async function postToSlack(payload) {
+  const res = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const body = await res.json();
+  if (!body.ok) {
+    throw new Error(`Slack post failed: ${JSON.stringify(body)}`);
+  }
+  return body;
+}
+
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).send("Vercel Slack handler is live");
   }
 
-  const rawBody = JSON.stringify(req.body ?? {});
+  const rawBody = await readRawBody(req);
+
   const timestamp = req.headers["x-slack-request-timestamp"];
   const slackSignature = req.headers["x-slack-signature"];
 
@@ -194,7 +223,7 @@ module.exports = async function handler(req, res) {
     return res.status(401).send("Invalid signature");
   }
 
-  const body = req.body || {};
+  const body = JSON.parse(rawBody || "{}");
 
   if (body.type === "url_verification" && body.challenge) {
     return res.status(200).send(body.challenge);
@@ -218,19 +247,11 @@ module.exports = async function handler(req, res) {
     });
 
     if (!todoistRes.ok) {
-      await fetch("https://slack.com/api/chat.postMessage", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          channel,
-          thread_ts,
-          text: `⚠️ Todoist fetch failed: ${todoistRes.status}`,
-        }),
+      await postToSlack({
+        channel,
+        thread_ts,
+        text: `⚠️ Todoist fetch failed: ${todoistRes.status}`,
       });
-
       return res.status(200).send("ok");
     }
 
@@ -242,7 +263,7 @@ module.exports = async function handler(req, res) {
 
     if (text.includes("brief me")) {
       try {
-        const payload = buildBriefPayload(tasks, buckets);
+        const payload = buildBriefPayload(buckets);
         reply = await callOpenRouterBrief(payload);
       } catch (err) {
         reply = `⚠️ Briefing failed.\n${err.message}`;
@@ -259,21 +280,14 @@ module.exports = async function handler(req, res) {
       reply = formatReply("updates", buckets.updates);
     }
 
-    await fetch("https://slack.com/api/chat.postMessage", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        channel,
-        thread_ts,
-        text: reply,
-      }),
+    await postToSlack({
+      channel,
+      thread_ts,
+      text: reply,
     });
 
     return res.status(200).send("ok");
   }
 
   return res.status(200).send("ok");
-};
+}
