@@ -73,7 +73,9 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       skipped: true,
-      reason: "No slack_user_id saved yet. Run a slash command like /agent settings first."
+      reason: "No slack_user_id saved yet. Run a slash command like /agent settings first.",
+      quietHours: config.quietHours,
+      agentPaused: config.agentPaused
     });
   }
 
@@ -87,15 +89,45 @@ export default async function handler(req, res) {
   const activeTaskIds = new Set();
   const alerts = [];
 
+  const diagnostics = {
+    todoist_tasks_fetched: tasks.length,
+    skipped_blocked_or_waiting: 0,
+    skipped_no_time_due: 0,
+    skipped_overdue_or_due_now: 0,
+    skipped_due_later_than_2h: 0,
+    eligible_within_2h: 0,
+    skipped_stage_already_sent: 0,
+    alerts_created: 0
+  };
+
+  const debugCandidates = [];
+
   for (const task of tasks) {
     activeTaskIds.add(String(task.id));
 
-    if (isBlockedOrWaiting(task)) continue;
+    if (isBlockedOrWaiting(task)) {
+      diagnostics.skipped_blocked_or_waiting += 1;
+      continue;
+    }
 
     const due = getTimedDueDate(task);
-    if (!due) continue;
-    if (due <= now) continue;
-    if (due > twoHoursFromNow) continue;
+
+    if (!due) {
+      diagnostics.skipped_no_time_due += 1;
+      continue;
+    }
+
+    if (due <= now) {
+      diagnostics.skipped_overdue_or_due_now += 1;
+      continue;
+    }
+
+    if (due > twoHoursFromNow) {
+      diagnostics.skipped_due_later_than_2h += 1;
+      continue;
+    }
+
+    diagnostics.eligible_within_2h += 1;
 
     const taskId = String(task.id);
     const fingerprint = fingerprintTask(task);
@@ -140,6 +172,18 @@ export default async function handler(req, res) {
       }
     }
 
+    debugCandidates.push({
+      id: taskId,
+      content: task.content,
+      due: dueIso,
+      time_left_minutes: Math.floor(timeLeftMs / 60000),
+      changed,
+      first_sent_at: entry.first_sent_at,
+      second_sent_at: entry.second_sent_at,
+      third_sent_at: entry.third_sent_at,
+      stage_to_send: stageToSend
+    });
+
     if (stageToSend) {
       alerts.push({
         task,
@@ -148,10 +192,14 @@ export default async function handler(req, res) {
         stage: stageToSend
       });
 
+      diagnostics.alerts_created += 1;
+
       const nowIso = now.toISOString();
       if (stageToSend === "first") entry.first_sent_at = nowIso;
       if (stageToSend === "second") entry.second_sent_at = nowIso;
       if (stageToSend === "third") entry.third_sent_at = nowIso;
+    } else {
+      diagnostics.skipped_stage_already_sent += 1;
     }
 
     newState[taskId] = entry;
@@ -195,7 +243,9 @@ export default async function handler(req, res) {
   return res.status(200).json({
     ok: true,
     alerts_sent: limitedAlerts.length,
-    considered: alerts.length,
+    considered: diagnostics.eligible_within_2h,
+    diagnostics,
+    debug_candidates: debugCandidates.slice(0, 10),
     quietHours: config.quietHours,
     agentPaused: config.agentPaused
   });
