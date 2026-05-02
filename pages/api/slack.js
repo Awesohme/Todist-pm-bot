@@ -62,32 +62,7 @@ function bucketTasks(tasks) {
   return buckets;
 }
 
-function formatReply(title, tasks) {
-  const emojiMap = {
-    overdue: "🚨",
-    today: "⏰",
-    blocked: "🧱",
-    waiting: "🕒",
-    updates: "📣",
-  };
-
-  const emoji = emojiMap[title] || "•";
-
-  if (!tasks.length) {
-    return `${emoji} *${title}*\n_Absolutely nothing here._`;
-  }
-
-  return (
-    `${emoji} *${title}* — *${tasks.length} item${tasks.length === 1 ? "" : "s"}*\n\n` +
-    tasks.map((t, i) => {
-      const due = t.due?.date ? `\n   🗓️ Due: ${formatHumanDate(t.due.date)}` : "";
-      const labels = t.labels?.length ? `\n   🏷️ ${t.labels.join(", ")}` : "";
-      return `*${i + 1}.* ${t.content}${due}${labels}`;
-    }).join("\n\n")
-  );
-}
-
-function summariseTaskForModel(task) {
+function summariseTask(task) {
   return {
     content: task.content,
     due: task.due?.date || null,
@@ -96,17 +71,18 @@ function summariseTaskForModel(task) {
   };
 }
 
-function buildBriefPayload(buckets) {
+function buildAgentPayload(tasks, buckets) {
   const important = [
-    ...buckets.overdue.slice(0, 10),
-    ...buckets.dueToday.slice(0, 10),
-    ...buckets.blocked.slice(0, 10),
-    ...buckets.waiting.slice(0, 10),
-    ...buckets.updates.slice(0, 10),
+    ...buckets.overdue.slice(0, 12),
+    ...buckets.dueToday.slice(0, 12),
+    ...buckets.blocked.slice(0, 12),
+    ...buckets.waiting.slice(0, 12),
+    ...buckets.updates.slice(0, 12),
   ];
 
   const seen = new Set();
   const deduped = [];
+
   for (const task of important) {
     const key = `${task.content}__${task.due?.date || ""}`;
     if (!seen.has(key)) {
@@ -123,11 +99,32 @@ function buildBriefPayload(buckets) {
       waiting: buckets.waiting.length,
       updates: buckets.updates.length,
     },
-    tasks: deduped.map(summariseTaskForModel),
+    tasks: deduped.map(summariseTask),
   };
 }
 
-async function callOpenRouterBrief(payload) {
+async function callOpenRouter(userMessage, payload) {
+  if (!process.env.OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY is missing");
+  }
+
+  const systemPrompt = [
+    "You are a sharp PM assistant inside Slack.",
+    "Truth over polish. Accuracy over service.",
+    "Use ONLY the provided Todoist snapshot and the user's message.",
+    "If the data does not support a claim, say you do not know or cannot verify it from the current task data.",
+    "Do not invent owners, blockers, meetings, progress, or priorities that are not in the snapshot.",
+    "Double-check your own claims against the provided counts and task list before answering.",
+    "Do not output multiple alternative answers. Give one final answer only.",
+    "Keep the format Slack-friendly, clean, and compact.",
+    "Preferred structure:",
+    "- one short opening line",
+    "- then 3 to 6 bullets max",
+    "- if useful, end with 'Next move:' and 1 to 3 actions",
+    "If the user asks about follow-ups, priorities, today, risks, what to tell boss, or what matters now, answer directly from the snapshot.",
+    "If the snapshot is noisy or includes personal tasks, say that briefly and still give the best answer you can.",
+  ].join(" ");
+
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -141,20 +138,16 @@ async function callOpenRouterBrief(payload) {
       messages: [
         {
           role: "system",
-          content:
-            "You are a sharp PM assistant. Be concise, direct, and practical. " +
-            "Given task data, return a Slack-friendly briefing with these headings only: " +
-            "1) Top risks, 2) What to chase today, 3) What to tell boss, 4) Suggested next 3 actions. " +
-            "Do not waffle. Prefer prioritisation over listing everything."
+          content: systemPrompt,
         },
         {
           role: "user",
           content:
-            "Create a concise PM briefing from this Todoist snapshot.\n\n" +
-            JSON.stringify(payload, null, 2)
+            `User asked:\n${userMessage}\n\n` +
+            `Todoist snapshot:\n${JSON.stringify(payload, null, 2)}`
         }
       ],
-      temperature: 0.2,
+      temperature: 0.15,
     }),
   });
 
@@ -164,7 +157,7 @@ async function callOpenRouterBrief(payload) {
   }
 
   const body = await res.json();
-  return body?.choices?.[0]?.message?.content || "No model response.";
+  return body?.choices?.[0]?.message?.content || "I couldn't produce a reliable answer.";
 }
 
 async function postToSlack(payload) {
@@ -181,6 +174,7 @@ async function postToSlack(payload) {
   if (!body.ok) {
     throw new Error(`Slack post failed: ${JSON.stringify(body)}`);
   }
+
   return body;
 }
 
@@ -190,6 +184,45 @@ async function readRawBody(req) {
     chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+async function processMention(event) {
+  const userText = (event.text || "").trim();
+  const channel = event.channel;
+  const thread_ts = event.thread_ts || event.ts;
+
+  const todoistRes = await fetch("https://api.todoist.com/api/v1/tasks?limit=200", {
+    headers: {
+      Authorization: `Bearer ${process.env.TODOIST_TOKEN}`,
+    },
+  });
+
+  if (!todoistRes.ok) {
+    await postToSlack({
+      channel,
+      thread_ts,
+      text: `⚠️ Todoist fetch failed: ${todoistRes.status}`,
+    });
+    return;
+  }
+
+  const todoistBody = await todoistRes.json();
+  const tasks = Array.isArray(todoistBody.results) ? todoistBody.results : [];
+  const buckets = bucketTasks(tasks);
+  const payload = buildAgentPayload(tasks, buckets);
+
+  let reply;
+  try {
+    reply = await callOpenRouter(userText, payload);
+  } catch (err) {
+    reply = `⚠️ I couldn’t answer that reliably.\n${err.message}`;
+  }
+
+  await postToSlack({
+    channel,
+    thread_ts,
+    text: reply,
+  });
 }
 
 export default async function handler(req, res) {
@@ -229,6 +262,11 @@ export default async function handler(req, res) {
     return res.status(200).send(body.challenge);
   }
 
+  // Ignore Slack retries to prevent duplicate thread replies
+  if (req.headers["x-slack-retry-num"]) {
+    return res.status(200).send("ok");
+  }
+
   if (body.type === "event_callback" && body.event?.type === "app_mention") {
     const event = body.event;
 
@@ -236,57 +274,13 @@ export default async function handler(req, res) {
       return res.status(200).send("ok");
     }
 
-    const text = (event.text || "").toLowerCase();
-    const channel = event.channel;
-    const thread_ts = event.thread_ts || event.ts;
+    // Ack immediately so Slack doesn't retry while we wait on Todoist / OpenRouter
+    res.status(200).send("ok");
 
-    const todoistRes = await fetch("https://api.todoist.com/api/v1/tasks?limit=200", {
-      headers: {
-        Authorization: `Bearer ${process.env.TODOIST_TOKEN}`,
-      },
+    processMention(event).catch((err) => {
+      console.error("processMention failed:", err);
     });
-
-    if (!todoistRes.ok) {
-      await postToSlack({
-        channel,
-        thread_ts,
-        text: `⚠️ Todoist fetch failed: ${todoistRes.status}`,
-      });
-      return res.status(200).send("ok");
-    }
-
-    const todoistBody = await todoistRes.json();
-    const tasks = Array.isArray(todoistBody.results) ? todoistBody.results : [];
-    const buckets = bucketTasks(tasks);
-
-    let reply = "I heard you. Try: overdue, today, blocked, waiting, updates, or brief me.";
-
-    if (text.includes("brief me")) {
-      try {
-        const payload = buildBriefPayload(buckets);
-        reply = await callOpenRouterBrief(payload);
-      } catch (err) {
-        reply = `⚠️ Briefing failed.\n${err.message}`;
-      }
-    } else if (text.includes("overdue")) {
-      reply = formatReply("overdue", buckets.overdue);
-    } else if (text.includes("today")) {
-      reply = formatReply("today", buckets.dueToday);
-    } else if (text.includes("blocked")) {
-      reply = formatReply("blocked", buckets.blocked);
-    } else if (text.includes("waiting")) {
-      reply = formatReply("waiting", buckets.waiting);
-    } else if (text.includes("update")) {
-      reply = formatReply("updates", buckets.updates);
-    }
-
-    await postToSlack({
-      channel,
-      thread_ts,
-      text: reply,
-    });
-
-    return res.status(200).send("ok");
+    return;
   }
 
   return res.status(200).send("ok");
