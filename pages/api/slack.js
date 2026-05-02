@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { waitUntil } from "@vercel/functions";
 
 export const config = {
   api: {
@@ -161,6 +162,25 @@ function buildAgentPayload(tasks, buckets) {
   };
 }
 
+function formatSimpleSection(title, tasks) {
+  if (!tasks.length) {
+    return `*${title}*\n• Nothing obvious from the current snapshot.`;
+  }
+
+  const top = tasks.slice(0, 8);
+
+  return (
+    `*${title}*\n\n` +
+    top
+      .map((t, i) => {
+        const due = t.due?.date ? `\n   🗓️ Due: ${formatHumanDate(t.due.date)}` : "";
+        const labels = t.labels?.length ? `\n   🏷️ ${t.labels.join(", ")}` : "";
+        return `*${i + 1}.* ${t.content}${due}${labels}`;
+      })
+      .join("\n\n")
+  );
+}
+
 function fallbackDeterministicReply(question, buckets) {
   const q = question.toLowerCase();
 
@@ -192,35 +212,17 @@ function fallbackDeterministicReply(question, buckets) {
     q.includes("priorities") ||
     q.includes("focus") ||
     q.includes("urgent") ||
-    q.includes("matters most")
+    q.includes("matters most") ||
+    q.includes("overdue")
   ) {
-    return formatSimpleSection("Priorities", [...buckets.dueToday, ...buckets.overdue.slice(0, 5)]);
+    return formatSimpleSection("Priorities", [...buckets.dueToday, ...buckets.overdue.slice(0, 8)]);
   }
 
   if (q.includes("boss") || q.includes("update")) {
     return formatSimpleSection("Boss update inputs", buckets.updates);
   }
 
-  return "I couldn’t answer that reliably from my fallback logic. Try rephrasing, or ask about today, follow-ups, priorities, or what to tell boss.";
-}
-
-function formatSimpleSection(title, tasks) {
-  if (!tasks.length) {
-    return `*${title}*\n• Nothing obvious from the current snapshot.`;
-  }
-
-  const top = tasks.slice(0, 8);
-
-  return (
-    `*${title}*\n\n` +
-    top
-      .map((t, i) => {
-        const due = t.due?.date ? `\n   🗓️ Due: ${formatHumanDate(t.due.date)}` : "";
-        const labels = t.labels?.length ? `\n   🏷️ ${t.labels.join(", ")}` : "";
-        return `*${i + 1}.* ${t.content}${due}${labels}`;
-      })
-      .join("\n\n")
-  );
+  return "I couldn’t answer that reliably from my fallback logic. Try rephrasing, or ask about today, follow-ups, priorities, overdue items, or what to tell boss.";
 }
 
 async function callOpenRouter(question, payload) {
@@ -229,23 +231,21 @@ async function callOpenRouter(question, payload) {
   }
 
   const systemPrompt = [
-    "You are a sharp execution assistant for the user across work and personal life.",
+    "You are a sharp execution assistant across work and personal life.",
     "Truth over polish. Accuracy over service.",
     "Use ONLY the provided Todoist snapshot and the user's question.",
     "Do not invent owners, meetings, blockers, urgency, progress, or external facts.",
     "If the data does not support a claim, say so clearly.",
     "You must self-check your answer against the provided counts and task list before responding.",
-    "The task set can include work, personal, spiritual, health, and relationship items. All are valid and important.",
+    "The task set can include work, personal, spiritual, health, and relationship items. All are valid.",
     "Infer the lens of the question before answering.",
     "If the user asks broad daily questions, answer across life and work.",
     "If the user asks work-specific questions like what to tell boss, bias toward professional/work-relevant items.",
     "If the user asks about follow-ups, prioritise waiting, stalled, or overdue items that appear follow-up-worthy.",
-    "If the user asks about priorities, weigh urgency, due dates, backlog pressure, and domain balance.",
+    "If the user asks about priorities or overdue items, weigh urgency, due dates, backlog pressure, and domain balance.",
     "If the data is noisy, say that briefly but still provide the best grounded answer you can.",
-    "Answer in Slack-friendly format:",
-    "1 short opening line max, then 3 to 6 bullets max, then optional 'Next move:' with up to 3 actions.",
+    "Answer in Slack-friendly format: 1 short opening line max, then 3 to 6 bullets max, then optional 'Next move:' with up to 3 actions.",
     "Do not produce multiple alternative answers.",
-    "Do not mention hidden chain-of-thought or internal reasoning.",
   ].join(" ");
 
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -310,7 +310,7 @@ async function readRawBody(req) {
 }
 
 async function processMention(event) {
-  const userText = (event.text || "").trim();
+  const userText = (event.text || "").replace(/<@[^>]+>/g, "").trim();
   const channel = event.channel;
   const thread_ts = event.thread_ts || event.ts;
 
@@ -388,7 +388,7 @@ export default async function handler(req, res) {
     return res.status(200).send(body.challenge);
   }
 
-  // Prevent duplicate replies when Slack retries
+  // Ignore Slack retries to avoid duplicate replies
   if (req.headers["x-slack-retry-num"]) {
     return res.status(200).send("ok");
   }
@@ -400,12 +400,15 @@ export default async function handler(req, res) {
       return res.status(200).send("ok");
     }
 
-    // Ack fast, then process async
+    // Ack immediately
     res.status(200).send("ok");
 
-    processMention(event).catch((err) => {
-      console.error("processMention failed:", err);
-    });
+    // Keep background work alive after response
+    waitUntil(
+      processMention(event).catch((err) => {
+        console.error("processMention failed:", err);
+      })
+    );
     return;
   }
 
