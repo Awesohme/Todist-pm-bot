@@ -43,6 +43,35 @@ function immediateAck(res, text = "🧠 Got it — working on that now...") {
   });
 }
 
+function helpText() {
+  return [
+    "*Available `/agent` commands*",
+    "",
+    "*Task views*",
+    "• `/agent today` — shows your Todoist tasks due today, grouped into useful buckets.",
+    "• `/agent followups` — shows tasks that look like follow-ups, waiting items, or things that may need chasing.",
+    "• `/agent priorities` — shows the highest-priority tasks the agent thinks you should look at first.",
+    "",
+    "*Reminder controls*",
+    "• `/agent settings` — shows current reminder settings, quiet hours, saved Slack user, and reminder stages.",
+    "• `/agent pause-reminders` — stops reminder messages, but keeps the agent itself active.",
+    "• `/agent resume-reminders` — turns reminder messages back on and clears any snooze.",
+    "• `/agent snooze 4h` — pauses reminders temporarily. You can also use `30m`, `1h`, `2h`, etc.",
+    "• `/agent disable 30m` — turns off the final T-30m reminder stage only.",
+    "• `/agent enable all` — turns reminders back on and enables T-2h, T-1h, and T-30m stages.",
+    "",
+    "*Quiet-hours controls*",
+    "• `/agent enable overnight` — allows reminders during quiet hours, currently 23:00 → 07:00 Africa/Lagos.",
+    "• `/agent disable overnight` — restores quiet hours, so reminders are blocked overnight again.",
+    "",
+    "*Master agent controls*",
+    "• `/agent pause-agent` — pauses the whole agent. Hourly reminder runs will skip completely.",
+    "• `/agent resume-agent` — resumes the whole agent.",
+    "",
+    "_Tip: use `/agent settings` after changing anything to confirm the new state._"
+  ].join("\n");
+}
+
 async function handleCommandAsync(form) {
   const text = String(form.text || "").trim();
   const command = text.toLowerCase();
@@ -54,25 +83,7 @@ async function handleCommandAsync(form) {
 
   if (!text || command === "help") {
     await saveReminderConfig(config);
-    return respondToSlack(
-      responseUrl,
-      [
-        "*Available `/agent` commands*",
-        "• `/agent today`",
-        "• `/agent followups`",
-        "• `/agent priorities`",
-        "• `/agent settings`",
-        "• `/agent pause-reminders`",
-        "• `/agent resume-reminders`",
-        "• `/agent snooze 4h`",
-        "• `/agent disable 30m`",
-        "• `/agent enable all`",
-        "• `/agent enable overnight`",
-        "• `/agent disable overnight`",
-        "• `/agent pause-agent`",
-        "• `/agent resume-agent`"
-      ].join("\n")
-    );
+    return respondToSlack(responseUrl, helpText());
   }
 
   if (command === "settings") {
@@ -182,9 +193,11 @@ async function handleCommandAsync(form) {
     if (command === "today") {
       return respondToSlack(responseUrl, quickTodayReply(buckets));
     }
+
     if (command === "followups") {
       return respondToSlack(responseUrl, quickFollowupsReply(buckets));
     }
+
     return respondToSlack(responseUrl, quickPrioritiesReply(buckets));
   }
 
