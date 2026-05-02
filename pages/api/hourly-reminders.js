@@ -31,6 +31,8 @@ function isBlockedOrWaiting(task) {
 }
 
 function shouldSkipByConfig(config) {
+  if (config.agentPaused) return "Agent is paused from Upstash config.";
+
   if (!config.reminders_enabled) return "Reminders are paused.";
 
   if (config.snoozed_until) {
@@ -41,7 +43,7 @@ function shouldSkipByConfig(config) {
   }
 
   if (isWithinQuietHours(config)) {
-    return `Inside quiet hours (${config.quiet_hours_start}:00 → ${config.quiet_hours_end}:00).`;
+    return `Inside quiet hours (${config.quietHours.start} → ${config.quietHours.end}, ${config.quietHours.timezone}).`;
   }
 
   return null;
@@ -58,13 +60,20 @@ export default async function handler(req, res) {
   const skipReason = shouldSkipByConfig(config);
 
   if (skipReason) {
-    return res.status(200).json({ ok: true, skipped: skipReason });
+    return res.status(200).json({
+      ok: true,
+      skipped: true,
+      reason: skipReason,
+      quietHours: config.quietHours,
+      agentPaused: config.agentPaused
+    });
   }
 
   if (!config.slack_user_id) {
     return res.status(200).json({
       ok: true,
-      skipped: "No slack_user_id saved yet. Run a slash command like /agent settings first."
+      skipped: true,
+      reason: "No slack_user_id saved yet. Run a slash command like /agent settings first."
     });
   }
 
@@ -186,6 +195,8 @@ export default async function handler(req, res) {
   return res.status(200).json({
     ok: true,
     alerts_sent: limitedAlerts.length,
-    considered: alerts.length
+    considered: alerts.length,
+    quietHours: config.quietHours,
+    agentPaused: config.agentPaused
   });
 }
