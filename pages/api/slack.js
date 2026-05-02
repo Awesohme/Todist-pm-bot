@@ -162,15 +162,15 @@ function buildAgentPayload(tasks, buckets) {
   };
 }
 
-function formatSimpleSection(title, tasks) {
+function formatPrettyFallback(title, tasks, emoji = "📌") {
   if (!tasks.length) {
-    return `*${title}*\n• Nothing obvious from the current snapshot.`;
+    return `${emoji} *${title}*\n_Absolutely nothing obvious here._`;
   }
 
   const top = tasks.slice(0, 8);
 
   return (
-    `*${title}*\n\n` +
+    `${emoji} *${title}*\n\n` +
     top
       .map((t, i) => {
         const due = t.due?.date ? `\n   🗓️ Due: ${formatHumanDate(t.due.date)}` : "";
@@ -193,7 +193,7 @@ function fallbackDeterministicReply(question, buckets) {
     q.includes("what's going on today") ||
     q.includes("whats going on today")
   ) {
-    return formatSimpleSection("Today", [...buckets.dueToday, ...buckets.overdue.slice(0, 5)]);
+    return formatPrettyFallback("Today’s lineup", [...buckets.dueToday, ...buckets.overdue.slice(0, 5)], "🗓️");
   }
 
   if (
@@ -204,7 +204,7 @@ function fallbackDeterministicReply(question, buckets) {
     q.includes("chase") ||
     q.includes("waiting")
   ) {
-    return formatSimpleSection("Follow-ups", [...buckets.waiting, ...buckets.overdue.slice(0, 5)]);
+    return formatPrettyFallback("Follow-ups", [...buckets.waiting, ...buckets.overdue.slice(0, 5)], "📨");
   }
 
   if (
@@ -215,14 +215,21 @@ function fallbackDeterministicReply(question, buckets) {
     q.includes("matters most") ||
     q.includes("overdue")
   ) {
-    return formatSimpleSection("Priorities", [...buckets.dueToday, ...buckets.overdue.slice(0, 8)]);
+    return formatPrettyFallback("Priority stack", [...buckets.dueToday, ...buckets.overdue.slice(0, 8)], "🔥");
   }
 
   if (q.includes("boss") || q.includes("update")) {
-    return formatSimpleSection("Boss update inputs", buckets.updates);
+    return formatPrettyFallback("Boss update inputs", buckets.updates, "📣");
   }
 
-  return "I couldn’t answer that reliably from my fallback logic. Try rephrasing, or ask about today, follow-ups, priorities, overdue items, or what to tell boss.";
+  return [
+    "🤔 *I’m not fully sure from fallback logic alone.*",
+    "I can answer best when you ask about:",
+    "• today / lineup",
+    "• follow-ups / who to chase",
+    "• priorities / overdue",
+    "• what to tell boss",
+  ].join("\n");
 }
 
 async function callOpenRouter(question, payload) {
@@ -240,12 +247,18 @@ async function callOpenRouter(question, payload) {
     "The task set can include work, personal, spiritual, health, and relationship items. All are valid.",
     "Infer the lens of the question before answering.",
     "If the user asks broad daily questions, answer across life and work.",
-    "If the user asks work-specific questions like what to tell boss, bias toward professional/work-relevant items.",
-    "If the user asks about follow-ups, prioritise waiting, stalled, or overdue items that appear follow-up-worthy.",
+    "If the user asks work-specific questions like what to tell boss, bias toward professional items.",
+    "If the user asks about follow-ups, prioritise waiting, stalled, or overdue items that look follow-up-worthy.",
     "If the user asks about priorities or overdue items, weigh urgency, due dates, backlog pressure, and domain balance.",
-    "If the data is noisy, say that briefly but still provide the best grounded answer you can.",
-    "Answer in Slack-friendly format: 1 short opening line max, then 3 to 6 bullets max, then optional 'Next move:' with up to 3 actions.",
-    "Do not produce multiple alternative answers.",
+    "If the data is noisy, say that briefly but still give the best grounded answer you can.",
+    "Answer in Slack-friendly format.",
+    "Style rules:",
+    "- Use a short opening line with one fitting emoji.",
+    "- Then give 3 to 6 bullets max.",
+    "- Use bold labels when useful.",
+    "- End with 'Next move:' and up to 3 actions if it helps.",
+    "- Be compact, readable, and practical.",
+    "- If you do not know, say so.",
   ].join(" ");
 
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -283,8 +296,8 @@ async function callOpenRouter(question, payload) {
   return body?.choices?.[0]?.message?.content || "I couldn't produce a reliable answer.";
 }
 
-async function postToSlack(payload) {
-  const res = await fetch("https://slack.com/api/chat.postMessage", {
+async function slackApi(method, payload) {
+  const res = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
@@ -295,10 +308,39 @@ async function postToSlack(payload) {
 
   const body = await res.json();
   if (!body.ok) {
-    throw new Error(`Slack post failed: ${JSON.stringify(body)}`);
+    throw new Error(`Slack ${method} failed: ${JSON.stringify(body)}`);
   }
 
   return body;
+}
+
+async function addReaction(channel, timestamp, name) {
+  try {
+    await slackApi("reactions.add", {
+      channel,
+      timestamp,
+      name,
+    });
+  } catch (err) {
+    // already_reacted etc. shouldn't kill the flow
+    console.error("addReaction failed:", err.message);
+  }
+}
+
+async function removeReaction(channel, timestamp, name) {
+  try {
+    await slackApi("reactions.remove", {
+      channel,
+      timestamp,
+      name,
+    });
+  } catch (err) {
+    console.error("removeReaction failed:", err.message);
+  }
+}
+
+async function postToSlack(payload) {
+  return slackApi("chat.postMessage", payload);
 }
 
 async function readRawBody(req) {
@@ -313,42 +355,67 @@ async function processMention(event) {
   const userText = (event.text || "").replace(/<@[^>]+>/g, "").trim();
   const channel = event.channel;
   const thread_ts = event.thread_ts || event.ts;
+  const sourceTs = event.ts;
 
-  const todoistRes = await fetch("https://api.todoist.com/api/v1/tasks?limit=200", {
-    headers: {
-      Authorization: `Bearer ${process.env.TODOIST_TOKEN}`,
-    },
-  });
+  await addReaction(channel, sourceTs, "eyes");
 
-  if (!todoistRes.ok) {
+  try {
+    const todoistRes = await fetch("https://api.todoist.com/api/v1/tasks?limit=200", {
+      headers: {
+        Authorization: `Bearer ${process.env.TODOIST_TOKEN}`,
+      },
+    });
+
+    if (!todoistRes.ok) {
+      await postToSlack({
+        channel,
+        thread_ts,
+        text: `⚠️ *I couldn't load Todoist properly.*\nStatus: ${todoistRes.status}`,
+      });
+      await removeReaction(channel, sourceTs, "eyes");
+      await addReaction(channel, sourceTs, "warning");
+      return;
+    }
+
+    const todoistBody = await todoistRes.json();
+    const tasks = Array.isArray(todoistBody.results) ? todoistBody.results : [];
+    const buckets = bucketTasks(tasks);
+    const payload = buildAgentPayload(tasks, buckets);
+
+    let reply;
+    try {
+      reply = await callOpenRouter(userText, payload);
+    } catch (err) {
+      reply =
+        `⚠️ *Model answer unavailable right now.*\n` +
+        `Reason: ${err.message}\n\n` +
+        fallbackDeterministicReply(userText, buckets);
+    }
+
     await postToSlack({
       channel,
       thread_ts,
-      text: `⚠️ Todoist fetch failed: ${todoistRes.status}`,
+      text: reply,
     });
-    return;
-  }
 
-  const todoistBody = await todoistRes.json();
-  const tasks = Array.isArray(todoistBody.results) ? todoistBody.results : [];
-  const buckets = bucketTasks(tasks);
-  const payload = buildAgentPayload(tasks, buckets);
-
-  let reply;
-  try {
-    reply = await callOpenRouter(userText, payload);
+    await removeReaction(channel, sourceTs, "eyes");
+    await addReaction(channel, sourceTs, "white_check_mark");
   } catch (err) {
-    reply =
-      `⚠️ I couldn’t answer that with the model right now.\n` +
-      `Reason: ${err.message}\n\n` +
-      fallbackDeterministicReply(userText, buckets);
-  }
+    console.error("processMention failed:", err);
 
-  await postToSlack({
-    channel,
-    thread_ts,
-    text: reply,
-  });
+    try {
+      await postToSlack({
+        channel,
+        thread_ts,
+        text: `⚠️ *Something went wrong while processing that.*\nI couldn't complete it reliably.`,
+      });
+    } catch (postErr) {
+      console.error("postToSlack after failure failed:", postErr);
+    }
+
+    await removeReaction(channel, sourceTs, "eyes");
+    await addReaction(channel, sourceTs, "warning");
+  }
 }
 
 export default async function handler(req, res) {
@@ -388,7 +455,6 @@ export default async function handler(req, res) {
     return res.status(200).send(body.challenge);
   }
 
-  // Ignore Slack retries to avoid duplicate replies
   if (req.headers["x-slack-retry-num"]) {
     return res.status(200).send("ok");
   }
@@ -400,13 +466,11 @@ export default async function handler(req, res) {
       return res.status(200).send("ok");
     }
 
-    // Ack immediately
     res.status(200).send("ok");
 
-    // Keep background work alive after response
     waitUntil(
       processMention(event).catch((err) => {
-        console.error("processMention failed:", err);
+        console.error("waitUntil processMention failed:", err);
       })
     );
     return;
