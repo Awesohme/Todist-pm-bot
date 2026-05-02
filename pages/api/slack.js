@@ -162,7 +162,7 @@ function buildAgentPayload(tasks, buckets) {
   };
 }
 
-function formatPrettyFallback(title, tasks, emoji = "📌") {
+function formatSimpleSection(title, tasks, emoji = "📌") {
   if (!tasks.length) {
     return `${emoji} *${title}*\n_Absolutely nothing obvious here._`;
   }
@@ -193,7 +193,7 @@ function fallbackDeterministicReply(question, buckets) {
     q.includes("what's going on today") ||
     q.includes("whats going on today")
   ) {
-    return formatPrettyFallback("Today’s lineup", [...buckets.dueToday, ...buckets.overdue.slice(0, 5)], "🗓️");
+    return formatSimpleSection("Today’s lineup", [...buckets.dueToday, ...buckets.overdue.slice(0, 5)], "🗓️");
   }
 
   if (
@@ -204,7 +204,7 @@ function fallbackDeterministicReply(question, buckets) {
     q.includes("chase") ||
     q.includes("waiting")
   ) {
-    return formatPrettyFallback("Follow-ups", [...buckets.waiting, ...buckets.overdue.slice(0, 5)], "📨");
+    return formatSimpleSection("Follow-ups", [...buckets.waiting, ...buckets.overdue.slice(0, 5)], "📨");
   }
 
   if (
@@ -215,11 +215,11 @@ function fallbackDeterministicReply(question, buckets) {
     q.includes("matters most") ||
     q.includes("overdue")
   ) {
-    return formatPrettyFallback("Priority stack", [...buckets.dueToday, ...buckets.overdue.slice(0, 8)], "🔥");
+    return formatSimpleSection("Priority stack", [...buckets.dueToday, ...buckets.overdue.slice(0, 8)], "🔥");
   }
 
   if (q.includes("boss") || q.includes("update")) {
-    return formatPrettyFallback("Boss update inputs", buckets.updates, "📣");
+    return formatSimpleSection("Boss update inputs", buckets.updates, "📣");
   }
 
   return [
@@ -230,6 +230,62 @@ function fallbackDeterministicReply(question, buckets) {
     "• priorities / overdue",
     "• what to tell boss",
   ].join("\n");
+}
+
+function safeArray(value, max = 6) {
+  return Array.isArray(value) ? value.slice(0, max).map((v) => String(v).trim()).filter(Boolean) : [];
+}
+
+function parseStructuredModelResponse(text) {
+  let cleaned = String(text || "").trim();
+
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  }
+
+  const parsed = JSON.parse(cleaned);
+
+  return {
+    lens: String(parsed.lens || "general").trim(),
+    opening: String(parsed.opening || "").trim(),
+    bullets: safeArray(parsed.bullets, 6),
+    next_moves: safeArray(parsed.next_moves, 3),
+    confidence_note: String(parsed.confidence_note || "").trim(),
+  };
+}
+
+function renderStructuredSlackText(data) {
+  const emojiMap = {
+    general: "🧭",
+    today: "🗓️",
+    followup: "📨",
+    priorities: "🔥",
+    work: "💼",
+    boss: "📣",
+    risk: "🚨",
+    balance: "⚖️",
+  };
+
+  const emoji = emojiMap[data.lens] || "🧠";
+  const parts = [];
+
+  if (data.opening) {
+    parts.push(`${emoji} *${data.opening}*`);
+  }
+
+  if (data.bullets.length) {
+    parts.push(data.bullets.map((b) => `• ${b}`).join("\n"));
+  }
+
+  if (data.next_moves.length) {
+    parts.push(`*Next move:*\n${data.next_moves.map((m, i) => `${i + 1}. ${m}`).join("\n")}`);
+  }
+
+  if (data.confidence_note) {
+    parts.push(`_${data.confidence_note}_`);
+  }
+
+  return parts.join("\n\n").trim() || "🤔 I couldn't build a reliable answer.";
 }
 
 async function callOpenRouter(question, payload) {
@@ -251,14 +307,15 @@ async function callOpenRouter(question, payload) {
     "If the user asks about follow-ups, prioritise waiting, stalled, or overdue items that look follow-up-worthy.",
     "If the user asks about priorities or overdue items, weigh urgency, due dates, backlog pressure, and domain balance.",
     "If the data is noisy, say that briefly but still give the best grounded answer you can.",
-    "Answer in Slack-friendly format.",
-    "Style rules:",
-    "- Use a short opening line with one fitting emoji.",
-    "- Then give 3 to 6 bullets max.",
-    "- Use bold labels when useful.",
-    "- End with 'Next move:' and up to 3 actions if it helps.",
-    "- Be compact, readable, and practical.",
-    "- If you do not know, say so.",
+    "Return STRICT JSON ONLY. No markdown. No code fences. No commentary outside JSON.",
+    "JSON schema:",
+    "{",
+    '  "lens": "one of: today, followup, priorities, work, boss, risk, balance, general",',
+    '  "opening": "short one-line summary",',
+    '  "bullets": ["3 to 6 concise bullets"],',
+    '  "next_moves": ["0 to 3 concrete next moves"],',
+    '  "confidence_note": "brief uncertainty note only if needed, else empty string"',
+    "}",
   ].join(" ");
 
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -283,7 +340,7 @@ async function callOpenRouter(question, payload) {
             `Todoist snapshot:\n${JSON.stringify(payload, null, 2)}`
         }
       ],
-      temperature: 0.15,
+      temperature: 0.1,
     }),
   });
 
@@ -293,7 +350,9 @@ async function callOpenRouter(question, payload) {
   }
 
   const body = await res.json();
-  return body?.choices?.[0]?.message?.content || "I couldn't produce a reliable answer.";
+  const content = body?.choices?.[0]?.message?.content || "";
+
+  return parseStructuredModelResponse(content);
 }
 
 async function slackApi(method, payload) {
@@ -322,7 +381,6 @@ async function addReaction(channel, timestamp, name) {
       name,
     });
   } catch (err) {
-    // already_reacted etc. shouldn't kill the flow
     console.error("addReaction failed:", err.message);
   }
 }
@@ -384,7 +442,8 @@ async function processMention(event) {
 
     let reply;
     try {
-      reply = await callOpenRouter(userText, payload);
+      const structured = await callOpenRouter(userText, payload);
+      reply = renderStructuredSlackText(structured);
     } catch (err) {
       reply =
         `⚠️ *Model answer unavailable right now.*\n` +
