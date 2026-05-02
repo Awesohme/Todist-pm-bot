@@ -13,7 +13,7 @@ import {
 function stageLabel(stage) {
   if (stage === "first") return "T-2h / first pass in window";
   if (stage === "second") return "T-1h";
-  if (stage === "third") return "T-30m";
+  if (stage === "third") return "T-30m / final warning";
   return "unknown";
 }
 
@@ -96,7 +96,7 @@ export default async function handler(req, res) {
     skipped_overdue_or_due_now: 0,
     skipped_due_later_than_2h: 0,
     eligible_within_2h: 0,
-    skipped_stage_already_sent: 0,
+    skipped_no_stage_ready: 0,
     alerts_created: 0
   };
 
@@ -166,7 +166,7 @@ export default async function handler(req, res) {
       if (config.enable_t1h) {
         stageToSend = "second";
       }
-    } else if (!entry.third_sent_at && timeLeftMs <= 30 * 60 * 1000) {
+    } else if (!entry.third_sent_at && timeLeftMs <= 45 * 60 * 1000) {
       if (config.enable_t30m) {
         stageToSend = "third";
       }
@@ -199,7 +199,7 @@ export default async function handler(req, res) {
       if (stageToSend === "second") entry.second_sent_at = nowIso;
       if (stageToSend === "third") entry.third_sent_at = nowIso;
     } else {
-      diagnostics.skipped_stage_already_sent += 1;
+      diagnostics.skipped_no_stage_ready += 1;
     }
 
     newState[taskId] = entry;
@@ -217,7 +217,10 @@ export default async function handler(req, res) {
 
   if (limitedAlerts.length > 0) {
     const lines = limitedAlerts.map((item, index) => {
-      const labels = item.task.labels?.length ? `\n   🏷️ ${item.task.labels.join(", ")}` : "";
+      const labels = item.task.labels?.length
+        ? `\n   🏷️ ${item.task.labels.join(", ")}`
+        : "";
+
       return [
         `*${index + 1}.* ${item.task.content}`,
         `   🗓️ Due: ${formatHumanDate(item.due.toISOString())}`,
