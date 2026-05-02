@@ -43,6 +43,7 @@ function bucketTasks(tasks) {
     blocked: [],
     waiting: [],
     updates: [],
+    allDatedTodayOrOverdue: [],
   };
 
   for (const task of tasks) {
@@ -56,34 +57,75 @@ function bucketTasks(tasks) {
     if (dueDate) {
       if (dueDate < today) buckets.overdue.push(task);
       if (dueDate === today) buckets.dueToday.push(task);
+      if (dueDate <= today) buckets.allDatedTodayOrOverdue.push(task);
     }
   }
 
   return buckets;
 }
 
-function summariseTask(task) {
+function inferDomain(task) {
+  const labels = (task.labels || []).map((l) => String(l).toLowerCase());
+  const content = String(task.content || "").toLowerCase();
+
+  const workHints = [
+    "professional",
+    "client",
+    "product",
+    "project",
+    "boss",
+    "meeting",
+    "demo",
+    "launch",
+    "delivery",
+    "engineering",
+    "design",
+    "analytics",
+    "hypothesis",
+    "research",
+    "testing",
+    "stakeholder",
+  ];
+
+  const spiritualHints = ["spiritual", "pray", "bible", "church", "scripture"];
+  const healthHints = ["health", "exercise", "gym", "walk", "sleep", "workout"];
+  const relationshipHints = ["relationship", "friend", "family", "call", "check in"];
+  const personalHints = ["personal", "home", "errand", "outfit", "shopping", "plan"];
+
+  const matches = (hints) =>
+    hints.some((hint) => labels.includes(hint) || content.includes(hint));
+
+  if (matches(workHints)) return "work";
+  if (matches(spiritualHints)) return "spiritual";
+  if (matches(healthHints)) return "health";
+  if (matches(relationshipHints)) return "relationship";
+  if (matches(personalHints)) return "personal";
+  return "unclear";
+}
+
+function summariseTaskForModel(task) {
   return {
     content: task.content,
     due: task.due?.date || null,
     labels: task.labels || [],
     priority: task.priority || 1,
+    domain: inferDomain(task),
   };
 }
 
 function buildAgentPayload(tasks, buckets) {
-  const important = [
-    ...buckets.overdue.slice(0, 12),
-    ...buckets.dueToday.slice(0, 12),
-    ...buckets.blocked.slice(0, 12),
-    ...buckets.waiting.slice(0, 12),
-    ...buckets.updates.slice(0, 12),
+  const highSignal = [
+    ...buckets.dueToday.slice(0, 20),
+    ...buckets.overdue.slice(0, 20),
+    ...buckets.blocked.slice(0, 20),
+    ...buckets.waiting.slice(0, 20),
+    ...buckets.updates.slice(0, 20),
   ];
 
   const seen = new Set();
   const deduped = [];
 
-  for (const task of important) {
+  for (const task of highSignal) {
     const key = `${task.content}__${task.due?.date || ""}`;
     if (!seen.has(key)) {
       seen.add(key);
@@ -91,38 +133,119 @@ function buildAgentPayload(tasks, buckets) {
     }
   }
 
+  const domains = {
+    work: 0,
+    personal: 0,
+    spiritual: 0,
+    health: 0,
+    relationship: 0,
+    unclear: 0,
+  };
+
+  for (const task of deduped) {
+    const domain = inferDomain(task);
+    domains[domain] = (domains[domain] || 0) + 1;
+  }
+
   return {
     counts: {
+      totalTasksFetched: tasks.length,
       overdue: buckets.overdue.length,
       dueToday: buckets.dueToday.length,
       blocked: buckets.blocked.length,
       waiting: buckets.waiting.length,
       updates: buckets.updates.length,
     },
-    tasks: deduped.map(summariseTask),
+    domainCountsFromHighSignal: domains,
+    tasks: deduped.map(summariseTaskForModel),
   };
 }
 
-async function callOpenRouter(userMessage, payload) {
+function fallbackDeterministicReply(question, buckets) {
+  const q = question.toLowerCase();
+
+  if (
+    q.includes("today") ||
+    q.includes("lineup") ||
+    q.includes("what do we have") ||
+    q.includes("what's up today") ||
+    q.includes("whats up today") ||
+    q.includes("what's going on today") ||
+    q.includes("whats going on today")
+  ) {
+    return formatSimpleSection("Today", [...buckets.dueToday, ...buckets.overdue.slice(0, 5)]);
+  }
+
+  if (
+    q.includes("follow up") ||
+    q.includes("follow-up") ||
+    q.includes("followups") ||
+    q.includes("follow ups") ||
+    q.includes("chase") ||
+    q.includes("waiting")
+  ) {
+    return formatSimpleSection("Follow-ups", [...buckets.waiting, ...buckets.overdue.slice(0, 5)]);
+  }
+
+  if (
+    q.includes("priority") ||
+    q.includes("priorities") ||
+    q.includes("focus") ||
+    q.includes("urgent") ||
+    q.includes("matters most")
+  ) {
+    return formatSimpleSection("Priorities", [...buckets.dueToday, ...buckets.overdue.slice(0, 5)]);
+  }
+
+  if (q.includes("boss") || q.includes("update")) {
+    return formatSimpleSection("Boss update inputs", buckets.updates);
+  }
+
+  return "I couldn’t answer that reliably from my fallback logic. Try rephrasing, or ask about today, follow-ups, priorities, or what to tell boss.";
+}
+
+function formatSimpleSection(title, tasks) {
+  if (!tasks.length) {
+    return `*${title}*\n• Nothing obvious from the current snapshot.`;
+  }
+
+  const top = tasks.slice(0, 8);
+
+  return (
+    `*${title}*\n\n` +
+    top
+      .map((t, i) => {
+        const due = t.due?.date ? `\n   🗓️ Due: ${formatHumanDate(t.due.date)}` : "";
+        const labels = t.labels?.length ? `\n   🏷️ ${t.labels.join(", ")}` : "";
+        return `*${i + 1}.* ${t.content}${due}${labels}`;
+      })
+      .join("\n\n")
+  );
+}
+
+async function callOpenRouter(question, payload) {
   if (!process.env.OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY is missing");
   }
 
   const systemPrompt = [
-    "You are a sharp PM assistant inside Slack.",
+    "You are a sharp execution assistant for the user across work and personal life.",
     "Truth over polish. Accuracy over service.",
-    "Use ONLY the provided Todoist snapshot and the user's message.",
-    "If the data does not support a claim, say you do not know or cannot verify it from the current task data.",
-    "Do not invent owners, blockers, meetings, progress, or priorities that are not in the snapshot.",
-    "Double-check your own claims against the provided counts and task list before answering.",
-    "Do not output multiple alternative answers. Give one final answer only.",
-    "Keep the format Slack-friendly, clean, and compact.",
-    "Preferred structure:",
-    "- one short opening line",
-    "- then 3 to 6 bullets max",
-    "- if useful, end with 'Next move:' and 1 to 3 actions",
-    "If the user asks about follow-ups, priorities, today, risks, what to tell boss, or what matters now, answer directly from the snapshot.",
-    "If the snapshot is noisy or includes personal tasks, say that briefly and still give the best answer you can.",
+    "Use ONLY the provided Todoist snapshot and the user's question.",
+    "Do not invent owners, meetings, blockers, urgency, progress, or external facts.",
+    "If the data does not support a claim, say so clearly.",
+    "You must self-check your answer against the provided counts and task list before responding.",
+    "The task set can include work, personal, spiritual, health, and relationship items. All are valid and important.",
+    "Infer the lens of the question before answering.",
+    "If the user asks broad daily questions, answer across life and work.",
+    "If the user asks work-specific questions like what to tell boss, bias toward professional/work-relevant items.",
+    "If the user asks about follow-ups, prioritise waiting, stalled, or overdue items that appear follow-up-worthy.",
+    "If the user asks about priorities, weigh urgency, due dates, backlog pressure, and domain balance.",
+    "If the data is noisy, say that briefly but still provide the best grounded answer you can.",
+    "Answer in Slack-friendly format:",
+    "1 short opening line max, then 3 to 6 bullets max, then optional 'Next move:' with up to 3 actions.",
+    "Do not produce multiple alternative answers.",
+    "Do not mention hidden chain-of-thought or internal reasoning.",
   ].join(" ");
 
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -131,7 +254,7 @@ async function callOpenRouter(userMessage, payload) {
       Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
       "Content-Type": "application/json",
       "HTTP-Referer": "https://vercel.app",
-      "X-OpenRouter-Title": "Todoist PM Agent",
+      "X-OpenRouter-Title": "Todoist Execution Agent",
     },
     body: JSON.stringify({
       model: "openrouter/free",
@@ -143,7 +266,7 @@ async function callOpenRouter(userMessage, payload) {
         {
           role: "user",
           content:
-            `User asked:\n${userMessage}\n\n` +
+            `User question:\n${question}\n\n` +
             `Todoist snapshot:\n${JSON.stringify(payload, null, 2)}`
         }
       ],
@@ -215,7 +338,10 @@ async function processMention(event) {
   try {
     reply = await callOpenRouter(userText, payload);
   } catch (err) {
-    reply = `⚠️ I couldn’t answer that reliably.\n${err.message}`;
+    reply =
+      `⚠️ I couldn’t answer that with the model right now.\n` +
+      `Reason: ${err.message}\n\n` +
+      fallbackDeterministicReply(userText, buckets);
   }
 
   await postToSlack({
@@ -262,7 +388,7 @@ export default async function handler(req, res) {
     return res.status(200).send(body.challenge);
   }
 
-  // Ignore Slack retries to prevent duplicate thread replies
+  // Prevent duplicate replies when Slack retries
   if (req.headers["x-slack-retry-num"]) {
     return res.status(200).send("ok");
   }
@@ -274,7 +400,7 @@ export default async function handler(req, res) {
       return res.status(200).send("ok");
     }
 
-    // Ack immediately so Slack doesn't retry while we wait on Todoist / OpenRouter
+    // Ack fast, then process async
     res.status(200).send("ok");
 
     processMention(event).catch((err) => {
