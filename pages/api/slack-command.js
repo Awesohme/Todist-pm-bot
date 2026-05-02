@@ -68,7 +68,9 @@ async function handleCommandAsync(form) {
         "• `/agent disable 30m`",
         "• `/agent enable all`",
         "• `/agent enable overnight`",
-        "• `/agent disable overnight`"
+        "• `/agent disable overnight`",
+        "• `/agent pause-agent`",
+        "• `/agent resume-agent`"
       ].join("\n")
     );
   }
@@ -79,19 +81,33 @@ async function handleCommandAsync(form) {
       responseUrl,
       [
         "*Reminder settings*",
-        `• enabled: ${config.reminders_enabled ? "yes" : "no"}`,
+        `• agent paused: ${config.agentPaused ? "yes" : "no"}`,
+        `• reminders enabled: ${config.reminders_enabled ? "yes" : "no"}`,
         `• snoozed until: ${config.snoozed_until || "not snoozed"}`,
         `• T-2h: ${config.enable_t2h ? "on" : "off"}`,
         `• T-1h: ${config.enable_t1h ? "on" : "off"}`,
         `• T-30m: ${config.enable_t30m ? "on" : "off"}`,
         `• max alerts per run: ${config.max_alerts_per_run}`,
         `• mode: ${config.mode}`,
-        `• quiet hours enabled: ${config.quiet_hours_enabled ? "yes" : "no"}`,
-        `• quiet window: ${config.quiet_hours_start}:00 → ${config.quiet_hours_end}:00`,
-        `• overnight reminders allowed: ${config.allow_overnight_reminders ? "yes" : "no"}`,
+        `• quiet hours enabled: ${config.quietHours.enabled ? "yes" : "no"}`,
+        `• quiet window: ${config.quietHours.start} → ${config.quietHours.end}`,
+        `• quiet timezone: ${config.quietHours.timezone}`,
+        `• overnight reminders allowed: ${config.quietHours.allowDuringQuietHours ? "yes" : "no"}`,
         `• reminder target user: ${config.slack_user_id ? `<@${config.slack_user_id}>` : "not set yet"}`
       ].join("\n")
     );
+  }
+
+  if (command === "pause-agent") {
+    config.agentPaused = true;
+    await saveReminderConfig(config);
+    return respondToSlack(responseUrl, "⏸️ Agent paused. Hourly reminder runs will now skip.");
+  }
+
+  if (command === "resume-agent") {
+    config.agentPaused = false;
+    await saveReminderConfig(config);
+    return respondToSlack(responseUrl, "✅ Agent resumed.");
   }
 
   if (command === "pause-reminders") {
@@ -140,12 +156,20 @@ async function handleCommandAsync(form) {
 
   if (command === "enable overnight") {
     config.allow_overnight_reminders = true;
+    config.quietHours = {
+      ...config.quietHours,
+      allowDuringQuietHours: true
+    };
     await saveReminderConfig(config);
     return respondToSlack(responseUrl, "🌙 Overnight reminders enabled.");
   }
 
   if (command === "disable overnight") {
     config.allow_overnight_reminders = false;
+    config.quietHours = {
+      ...config.quietHours,
+      allowDuringQuietHours: false
+    };
     await saveReminderConfig(config);
     return respondToSlack(responseUrl, "🌙 Quiet hours restored. Overnight reminders disabled.");
   }
